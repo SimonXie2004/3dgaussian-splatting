@@ -1,0 +1,6 @@
+Default Dataset Dir
+/nerf_synthetic
+
+Multiscale Dataset Dir:
+/data/new_disk3/Dataset/nerf_synthetic_4
+

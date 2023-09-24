@@ -39,7 +39,7 @@ class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
     train_cameras: list
     test_cameras: list
-    nerf_normalization: dict
+    nerf_normalization: dict # with "translate" and "radius" as keys
     ply_path: str
 
 def getNerfppNorm(cam_info):
@@ -254,7 +254,119 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
                            ply_path=ply_path)
     return scene_info
 
+def readMetadataFrames(path, target_json, white_background, extension):
+    '''
+    Warning: Supposes that all input of arguments have the same length
+             Otherwise, the behaviour can be undefined
+    '''
+
+    camera_list = []
+
+    for idx in range(len(target_json['file_path'])):
+        cam_name = os.path.join(path, target_json["file_path"][idx])
+
+        # 4*4 np array
+        c2w = np.array(target_json["cam2world"][idx])
+        c2w[:3, 1:3] *= -1
+
+        w2c = np.linalg.inv(c2w)
+        R = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code
+        T = w2c[:3, 3]
+
+        image_path = os.path.join(path, cam_name)
+        image_name = Path(cam_name).stem
+        image = Image.open(image_path)
+
+        im_data = np.array(image.convert("RGBA"))
+
+        bg = np.array([1,1,1]) if white_background else np.array([0, 0, 0])
+
+        norm_data = im_data / 255.0
+        arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
+        image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
+
+        # ??????
+        focalx = target_json["focal"][idx]
+        FovX = focal2fov(focalx, image.size[0])
+        FovY = focal2fov(focalx, image.size[1])
+
+        camera_list.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1]))
+
+    return camera_list
+
+    '''
+    Input: omitted
+    Output: list of CameraInfo() where
+        Camerainfo() = NamedTuple, with
+            uid: int -> index
+            R: np.array
+            T: np.array
+            FovY: np.array
+            FovX: np.array
+            image: np.array -> PIL.image
+            image_path: str
+            image_name: str
+            width: int
+            height: int
+    '''
+
+def readCamerasFromMetadata(path, metadatafile, white_background, extension=".png"):
+    train_cam_infos = []
+    test_cam_infos = []
+
+    with open(os.path.join(path, metadatafile)) as fileobj:
+        contents = json.load(fileobj)
+        
+        train_frames = contents["train"]
+        test_frames = contents["test"]
+        val_frames = contents["val"]
+
+        train_cam_infos = readMetadataFrames(path, train_frames, white_background, extension=extension)
+        test_cam_infos = readMetadataFrames(path, test_frames, white_background, extension=extension)
+
+    return train_cam_infos, test_cam_infos
+
+def readMultiscaleNerfSyntheticInfo(path, white_background, eval, extension=".png"):
+
+    # train_cam + test_cam part, modifying
+    print("Reading Test and Train Transforms from metadata.json")
+    train_cam_infos, test_cam_infos = readCamerasFromMetadata(path, "metadata.json", white_background, extension)
+
+    if not eval:
+        train_cam_infos.extend(test_cam_infos)
+        test_cam_infos = []
+
+    # nerf_normalization part -- needn't modification
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    # ply_path + pcd part -- needn't modification
+    ply_path = os.path.join(path, "points3d.ply")
+    if not os.path.exists(ply_path):
+        # Since this data set has no colmap data, we start with random points
+        num_pts = 100_000
+        print(f"Generating random point cloud ({num_pts})...")
+        
+        # We create random points inside the bounds of the synthetic Blender scenes
+        xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
+        shs = np.random.random((num_pts, 3)) / 255.0
+        pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
+
+        storePly(ply_path, xyz, SH2RGB(shs) * 255)
+    try:
+        pcd = fetchPly(ply_path)
+    except:
+        pcd = None
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path)
+    return scene_info
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
-    "Blender" : readNerfSyntheticInfo
+    "Blender" : readNerfSyntheticInfo,
+    "Multiscale" : readMultiscaleNerfSyntheticInfo
 }
